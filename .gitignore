@@ -1,3 +1,5 @@
 node_modules/
 dist/
 *.sock
+superset-term
+superset-session-cli

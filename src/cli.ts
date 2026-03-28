@@ -13,7 +13,8 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
-import { DaemonClient } from "./client.js";
+import { Database } from "bun:sqlite";
+import { DaemonClient, type SessionInfo } from "./client.js";
 import { attachSession } from "./attach.js";
 
 // ---------------------------------------------------------------------------
@@ -23,89 +24,217 @@ import { attachSession } from "./attach.js";
 const SUPERSET_DIR = path.join(os.homedir(), ".superset");
 const SOCKET_PATH = path.join(SUPERSET_DIR, "terminal-host.sock");
 const TOKEN_PATH = path.join(SUPERSET_DIR, "terminal-host.token");
+const LOCAL_DB_PATH = path.join(SUPERSET_DIR, "local.db");
 
 // ---------------------------------------------------------------------------
-// SSH tunnel helper
+// SSH helpers — uses ControlMaster so password is only entered once
 // ---------------------------------------------------------------------------
+
+function sshControlPath(host: string): string {
+  // Unix socket paths are limited to ~104 chars — keep it short
+  const hash = Buffer.from(host).toString("base64url").slice(0, 8);
+  return `/tmp/st-${hash}`;
+}
+
+/** Common SSH args that reuse the ControlMaster connection. */
+function sshOpts(host: string): string[] {
+  return [
+    "-o", `ControlPath=${sshControlPath(host)}`,
+    "-o", "ControlMaster=no",
+  ];
+}
+
+/** Establish a ControlMaster SSH connection (inherits stdin for password). */
+function startSshMaster(host: string): Promise<ChildProcess> {
+  const ctlPath = sshControlPath(host);
+  // Clean up stale socket
+  if (fs.existsSync(ctlPath)) try { fs.unlinkSync(ctlPath); } catch {}
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(
+      "ssh",
+      [
+        "-o", `ControlPath=${ctlPath}`,
+        "-o", "ControlMaster=yes",
+        "-o", "ControlPersist=120",
+        "-N", // no remote command
+        host,
+      ],
+      { stdio: ["inherit", "ignore", "inherit"] }, // inherit stdin/stderr for password prompt
+    );
+
+    // Wait for the control socket to appear
+    const start = Date.now();
+    const check = () => {
+      if (fs.existsSync(ctlPath)) return resolve(proc);
+      if (Date.now() - start > 30000) {
+        proc.kill();
+        return reject(new Error("SSH master connection timed out"));
+      }
+      setTimeout(check, 200);
+    };
+    proc.on("error", reject);
+    proc.on("exit", (code) => {
+      if (code !== 0 && !fs.existsSync(ctlPath)) {
+        reject(new Error(`SSH connection failed (exit ${code})`));
+      }
+    });
+    setTimeout(check, 300);
+  });
+}
+
+/** Run a command on the remote host via the master connection. */
+function sshExec(host: string, cmd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("ssh", [...sshOpts(host), host, cmd], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout?.on("data", (c: Buffer) => { stdout += c; });
+    proc.stderr?.on("data", (c: Buffer) => { stderr += c; });
+    proc.on("close", (code) => {
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(`ssh command failed (exit ${code}): ${stderr.trim()}`));
+    });
+  });
+}
+
+/** Fetch remote home dir, token, and paths in one SSH call. */
+async function getRemoteInfo(host: string): Promise<{
+  token: string;
+  remoteSocket: string;
+  remoteDbPath: string;
+}> {
+  const raw = await sshExec(
+    host,
+    'echo "$HOME" && cat "$HOME/.superset/terminal-host.token"',
+  );
+  const lines = raw.split("\n");
+  const home = lines[0];
+  const token = lines[1];
+  if (!home || !token) throw new Error("Could not read remote home or token");
+  return {
+    token,
+    remoteSocket: `${home}/.superset/terminal-host.sock`,
+    remoteDbPath: `${home}/.superset/local.db`,
+  };
+}
 
 function startSshTunnel(
   host: string,
   localSocket: string,
-): { proc: ChildProcess; socketPath: string } {
-  const remoteSocket = `~/.superset/terminal-host.sock`;
-  // Use SSH local Unix socket forwarding: -L local:remote
+  remoteSocket: string,
+): ChildProcess {
   const proc = spawn(
     "ssh",
-    [
-      "-N", // no remote command
-      "-L",
-      `${localSocket}:${remoteSocket}`,
-      host,
-    ],
+    [...sshOpts(host), "-N", "-L", `${localSocket}:${remoteSocket}`, host],
     { stdio: ["ignore", "ignore", "pipe"] },
   );
-
   proc.stderr?.on("data", (chunk: Buffer) => {
     const msg = chunk.toString().trim();
     if (msg) console.error(`[ssh] ${msg}`);
   });
-
-  return { proc, socketPath: localSocket };
+  return proc;
 }
 
-async function getRemoteToken(host: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn("ssh", [host, "cat", "~/.superset/terminal-host.token"], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    proc.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    proc.on("close", (code) => {
-      if (code === 0) {
-        resolve(stdout.trim());
-      } else {
-        reject(new Error(`Failed to read remote token (ssh exit ${code})`));
-      }
-    });
-  });
-}
-
-function waitForSocket(socketPath: string, timeoutMs = 5000): Promise<void> {
+function waitForSocket(socketPath: string, timeoutMs = 10000): Promise<void> {
   const start = Date.now();
   return new Promise((resolve, reject) => {
     const check = () => {
       if (fs.existsSync(socketPath)) return resolve();
-      if (Date.now() - start > timeoutMs) {
+      if (Date.now() - start > timeoutMs)
         return reject(new Error(`SSH tunnel socket not ready after ${timeoutMs}ms`));
-      }
       setTimeout(check, 200);
     };
     check();
   });
 }
 
+/** Copy remote local.db via scp for workspace metadata lookup. */
+async function fetchRemoteDb(host: string, remoteDbPath: string): Promise<string> {
+  const localCopy = path.join(os.tmpdir(), `superset-term-${process.pid}.db`);
+  return new Promise((resolve) => {
+    const proc = spawn(
+      "scp",
+      ["-q", "-o", `ControlPath=${sshControlPath(host)}`, `${host}:${remoteDbPath}`, localCopy],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+    proc.on("close", (code) => {
+      resolve(code === 0 ? localCopy : "");
+    });
+  });
+}
+
+/** Tear down the ControlMaster. */
+function stopSshMaster(host: string): void {
+  const ctlPath = sshControlPath(host);
+  try {
+    spawn("ssh", ["-o", `ControlPath=${ctlPath}`, "-O", "exit", host], {
+      stdio: "ignore",
+    });
+  } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Workspace metadata from local DB
+// ---------------------------------------------------------------------------
+
+interface WorkspaceMeta {
+  project: string;
+  workspace: string;
+  branch: string;
+  path: string;
+}
+
+function loadWorkspaceMeta(dbPath: string): Map<string, WorkspaceMeta> {
+  const map = new Map<string, WorkspaceMeta>();
+  try {
+    const db = new Database(dbPath, { readonly: true });
+    const rows = db.query(`
+      SELECT w.id, p.name AS project, w.name AS workspace, w.branch,
+             COALESCE(wt.path, p.main_repo_path) AS path
+      FROM workspaces w
+      LEFT JOIN worktrees wt ON w.worktree_id = wt.id
+      JOIN projects p ON w.project_id = p.id
+    `).all() as Array<{ id: string; project: string; workspace: string; branch: string; path: string }>;
+    for (const r of rows) {
+      map.set(r.id, { project: r.project, workspace: r.workspace, branch: r.branch, path: r.path });
+    }
+    db.close();
+  } catch {
+    // DB not available (e.g. remote mode) — gracefully degrade
+  }
+  return map;
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
-async function cmdList(client: DaemonClient): Promise<void> {
+async function cmdList(client: DaemonClient, dbPath: string): Promise<void> {
   const sessions = await client.listSessions();
   if (sessions.length === 0) {
     console.log("No active sessions.");
     return;
   }
 
-  console.log(
-    `${"SESSION ID".padEnd(40)} ${"WORKSPACE".padEnd(20)} ${"SHELL".padEnd(8)} ${"PID".padEnd(8)} ${"ALIVE".padEnd(6)} CLIENTS`,
-  );
-  console.log("-".repeat(100));
+  const meta = loadWorkspaceMeta(dbPath);
 
   for (const s of sessions) {
-    console.log(
-      `${s.sessionId.padEnd(40)} ${s.workspaceId.slice(0, 18).padEnd(20)} ${(s.shell ?? "?").padEnd(8)} ${String(s.pid ?? "-").padEnd(8)} ${(s.isAlive ? "yes" : "no").padEnd(6)} ${s.attachedClients}`,
-    );
+    const m = meta.get(s.workspaceId);
+    const alive = s.isAlive ? "\x1b[32m●\x1b[0m" : "\x1b[90m○\x1b[0m";
+    const label = m
+      ? `\x1b[1m${m.project}\x1b[0m / ${m.workspace} \x1b[90m(${m.branch})\x1b[0m`
+      : `\x1b[90m${s.workspaceId}\x1b[0m`;
+    const dir = m?.path
+      ? `\x1b[90m${m.path.replace(os.homedir(), "~")}\x1b[0m`
+      : "";
+
+    console.log(`${alive} ${label}`);
+    console.log(`  id: ${s.sessionId}  pid: ${s.pid ?? "-"}  clients: ${s.attachedClients}`);
+    if (dir) console.log(`  ${dir}`);
+    console.log();
   }
 }
 
@@ -173,34 +302,42 @@ Detach: Ctrl+^ then q (session keeps running)
   }
 
   let socketPath = SOCKET_PATH;
+  let dbPath = LOCAL_DB_PATH;
   let token: string;
   let sshProc: ChildProcess | undefined;
+  const tmpFiles: string[] = [];
 
   if (remoteHost) {
-    // Remote mode: SSH tunnel + fetch token
     console.error(`Connecting to ${remoteHost}...`);
-    token = await getRemoteToken(remoteHost);
 
-    const tmpSocket = path.join(
-      os.tmpdir(),
-      `superset-term-${process.pid}.sock`,
-    );
-    // Clean up stale socket
+    // 1. Establish master connection (only password prompt happens here)
+    sshProc = await startSshMaster(remoteHost);
+    console.error("SSH connected.");
+
+    // 2. All subsequent SSH ops reuse the master — no more password prompts
+    const remote = await getRemoteInfo(remoteHost);
+    token = remote.token;
+
+    const tmpSocket = `/tmp/st-tun-${process.pid}.sock`;
     if (fs.existsSync(tmpSocket)) fs.unlinkSync(tmpSocket);
+    tmpFiles.push(tmpSocket);
 
-    const tunnel = startSshTunnel(remoteHost, tmpSocket);
-    sshProc = tunnel.proc;
-    socketPath = tunnel.socketPath;
+    // Start tunnel + fetch DB in parallel (both reuse master)
+    const tunnelProc = startSshTunnel(remoteHost, tmpSocket, remote.remoteSocket);
+    const dbCopyPromise = fetchRemoteDb(remoteHost, remote.remoteDbPath);
 
-    // Wait for tunnel to be ready
+    socketPath = tmpSocket;
     await waitForSocket(socketPath);
     console.error("SSH tunnel established.");
+
+    const dbCopy = await dbCopyPromise;
+    if (dbCopy) {
+      dbPath = dbCopy;
+      tmpFiles.push(dbCopy);
+    }
   } else {
-    // Local mode
     if (!fs.existsSync(SOCKET_PATH)) {
-      console.error(
-        "Daemon socket not found. Is Superset running?",
-      );
+      console.error("Daemon socket not found. Is Superset running?");
       process.exit(1);
     }
     token = fs.readFileSync(TOKEN_PATH, "utf-8").trim();
@@ -211,9 +348,10 @@ Detach: Ctrl+^ then q (session keeps running)
   // Cleanup on exit
   const cleanupAll = () => {
     client.destroy();
+    if (remoteHost) stopSshMaster(remoteHost);
     sshProc?.kill();
-    if (remoteHost && fs.existsSync(socketPath)) {
-      try { fs.unlinkSync(socketPath); } catch {}
+    for (const f of tmpFiles) {
+      try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
     }
   };
   process.on("exit", cleanupAll);
@@ -235,7 +373,7 @@ Detach: Ctrl+^ then q (session keeps running)
   switch (command) {
     case "list":
     case "ls":
-      await cmdList(client);
+      await cmdList(client, dbPath);
       cleanupAll();
       break;
 

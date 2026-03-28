@@ -1,10 +1,10 @@
 {
-  "name": "superset-term",
+  "name": "superset-session-cli",
   "version": "0.1.0",
-  "description": "CLI to attach to Superset terminal daemon sessions (local or remote via SSH)",
+  "description": "CLI to list and attach to Superset terminal daemon sessions (local or remote via SSH)",
   "type": "module",
   "bin": {
-    "superset-term": "./dist/cli.js"
+    "superset-session": "./dist/cli.js"
   },
   "scripts": {
     "build": "bun build src/cli.ts --outdir dist --target node",
