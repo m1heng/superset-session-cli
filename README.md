@@ -12,14 +12,28 @@ Superset's terminal sessions are managed by a persistent daemon that survives ap
 
 ## Install
 
-### Standalone binary (no dependencies)
+### npx / bunx (requires Bun)
 
 ```bash
-# Build for macOS arm64
-bun build src/cli.ts --compile --target=bun-darwin-arm64 --outfile superset-session
+bunx superset-session-cli list
+bunx superset-session-cli attach <session-id>
+```
 
-# Copy to remote machine
-scp superset-session user@remote:~/superset-session
+### Standalone binary (no dependencies)
+
+Download from [GitHub Releases](https://github.com/m1heng/superset-session-cli/releases/latest):
+
+| Platform | Binary |
+|---|---|
+| macOS Apple Silicon | `superset-session-darwin-arm64` |
+| macOS Intel | `superset-session-darwin-x64` |
+
+```bash
+# Example: Apple Silicon Mac
+curl -L -o superset-session \
+  https://github.com/m1heng/superset-session-cli/releases/latest/download/superset-session-darwin-arm64
+chmod +x superset-session
+./superset-session list
 ```
 
 ### From source
@@ -28,6 +42,7 @@ scp superset-session user@remote:~/superset-session
 git clone https://github.com/m1heng/superset-session-cli.git
 cd superset-session-cli
 bun install
+bun run src/cli.ts list
 ```
 
 ## Usage
